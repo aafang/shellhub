@@ -2,7 +2,7 @@
 # =============================================
 # AnyTLS-Go Linux 服务端一键安装与管理脚本
 # 功能：交互菜单 / 升级保留配置 / 随机密码 / 自定义或随机端口
-# AnyTLS项目：https://github.com/anytls/anytls-go
+# 项目：https://github.com/anytls/anytls-go
 # =============================================
 
 set -e
@@ -26,11 +26,14 @@ NC='\033[0m'
 
 info() { echo -e "${GREEN}[信息] $1${NC}"; }
 warn() { echo -e "${YELLOW}[提示] $1${NC}"; }
-error() { echo -e "${RED}[错误] $1${NC}"; exit 1; }
+error() { echo -e "${RED}[错误] $1${NC}"; return 1; }
 
 # ====================== 通用检查 ======================
 require_root() {
-    [ "$(id -u)" -ne 0 ] && error "请使用 root 或 sudo 运行此脚本"
+    if [ "$(id -u)" -ne 0 ]; then
+        error "请使用 root 或 sudo 运行此脚本"
+        return 1
+    fi
 }
 
 command_exists() {
@@ -143,14 +146,14 @@ generate_random_port() {
 choose_port() {
     local choice custom_port random_port confirm
 
-    echo
-    echo -e "${BOLD}端口设置${NC}"
-    echo "  1）使用默认端口 ${DEFAULT_PORT}"
-    echo "  2）手动输入端口"
-    echo "  3）随机生成可用端口"
+    >&2 echo
+    >&2 echo -e "${BOLD}端口设置${NC}"
+    >&2 echo "  1）使用默认端口 ${DEFAULT_PORT}"
+    >&2 echo "  2）手动输入端口"
+    >&2 echo "  3）随机生成可用端口"
 
     while true; do
-        read -rp "请选择 [1-3，默认 1]：" choice
+        read -rp "请选择 [1-3，默认 1]：" choice >&2
         choice=${choice:-1}
         case "$choice" in
             1)
@@ -458,14 +461,14 @@ interactive_menu() {
         show_menu
         read -rp "请输入菜单编号 [0-8]：" choice
         case "$choice" in
-            1) do_install; pause_if_needed ;;
-            2) do_upgrade; pause_if_needed ;;
-            3) show_current_config; pause_if_needed ;;
-            4) show_service_status; pause_if_needed ;;
-            5) reset_port; pause_if_needed ;;
-            6) reset_password; pause_if_needed ;;
-            7) uninstall_anytls; pause_if_needed ;;
-            8) show_help; pause_if_needed ;;
+            1) do_install || true; pause_if_needed ;;
+            2) do_upgrade || true; pause_if_needed ;;
+            3) show_current_config || true; pause_if_needed ;;
+            4) show_service_status || true; pause_if_needed ;;
+            5) reset_port || true; pause_if_needed ;;
+            6) reset_password || true; pause_if_needed ;;
+            7) uninstall_anytls || true; pause_if_needed ;;
+            8) show_help || true; pause_if_needed ;;
             0)
                 info "已退出脚本"
                 break
