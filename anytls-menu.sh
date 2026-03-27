@@ -11,6 +11,8 @@ set -e
 INSTALL_BIN_DIR="/usr/local/bin"
 SERVICE_NAME="anytls"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+CONFIG_DIR="/etc/anytls"
+CONFIG_FILE="${CONFIG_DIR}/anytls.conf"
 DEFAULT_PORT=8443
 PORT_MIN=1024
 PORT_MAX=65535
@@ -24,9 +26,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-info() { echo -e "${GREEN}[信息] $1${NC}"; }
-warn() { echo -e "${YELLOW}[提示] $1${NC}"; }
-error() { echo -e "${RED}[错误] $1${NC}"; return 1; }
+info() { echo -e "${GREEN}[信息] $1${NC}" >&2; }
+warn() { echo -e "${YELLOW}[提示] $1${NC}" >&2; }
+error() { echo -e "${RED}[错误] $1${NC}" >&2; return 1; }
 
 # ====================== 通用检查 ======================
 require_root() {
@@ -41,7 +43,7 @@ command_exists() {
 }
 
 is_installed() {
-    [ -f "${SERVICE_FILE}" ] && [ -x "${INSTALL_BIN_DIR}/anytls-server" ]
+    [ -s "${SERVICE_FILE}" ] && [ -s "${CONFIG_FILE}" ] && [ -x "${INSTALL_BIN_DIR}/anytls-server" ]
 }
 
 is_valid_port() {
@@ -60,21 +62,31 @@ is_port_in_use() {
     fi
 }
 
-get_service_execstart() {
-    [ -f "${SERVICE_FILE}" ] || return 1
-    grep '^ExecStart=' "${SERVICE_FILE}" | head -n 1
-}
-
 get_current_port() {
-    local exec_line
-    exec_line=$(get_service_execstart) || return 1
-    echo "$exec_line" | sed -n 's/.*-l [^:]*:\([0-9]\{1,5\}\).*/\1/p'
+    [ -f "${CONFIG_FILE}" ] || return 1
+    sed -n 's/^PORT=//p' "${CONFIG_FILE}" | head -n 1
 }
 
 get_current_password() {
-    local exec_line
-    exec_line=$(get_service_execstart) || return 1
-    echo "$exec_line" | sed -n 's/.*-p "\([^"]*\)".*/\1/p'
+    [ -f "${CONFIG_FILE}" ] || return 1
+    sed -n 's/^PASSWORD=//p' "${CONFIG_FILE}" | head -n 1
+}
+
+save_config() {
+    local port=$1
+    local password=$2
+
+    if ! is_valid_port "$port" || [ -z "$password" ]; then
+        error "配置保存失败：端口或密码无效"
+        return 1
+    fi
+
+    mkdir -p "${CONFIG_DIR}"
+    umask 077
+    cat > "${CONFIG_FILE}" <<EOF2
+PORT=${port}
+PASSWORD=${password}
+EOF2
 }
 
 get_service_status_text() {
@@ -104,6 +116,11 @@ print_divider() {
     echo -e "${BLUE}--------------------------------------------------${NC}"
 }
 
+print_section() {
+    echo
+    echo -e "${BOLD}$1${NC}"
+}
+
 print_header() {
     clear 2>/dev/null || true
     echo -e "${CYAN}${BOLD}==================================================${NC}"
@@ -115,8 +132,12 @@ show_summary() {
     local install_text service_text current_port
 
     if is_installed; then
-        install_text="${GREEN}已安装${NC}"
-        current_port=$(get_current_port)
+        current_port=$(get_current_port 2>/dev/null || true)
+        if [ -n "$current_port" ]; then
+            install_text="${GREEN}已安装${NC}"
+        else
+            install_text="${YELLOW}安装异常${NC}"
+        fi
         [ -z "$current_port" ] && current_port="未知"
     else
         install_text="${RED}未安装${NC}"
@@ -153,7 +174,7 @@ choose_port() {
     >&2 echo "  3）随机生成可用端口"
 
     while true; do
-        read -rp "请选择 [1-3，默认 1]：" choice >&2
+        read -rp "请选择 [1-3，默认 1]：" choice
         choice=${choice:-1}
         case "$choice" in
             1)
@@ -161,11 +182,11 @@ choose_port() {
                     warn "默认端口 ${DEFAULT_PORT} 已被占用，请确认是否继续使用"
                     read -rp "仍然使用默认端口吗？[y/N]：" confirm
                     case "$confirm" in
-                        y|Y) echo "$DEFAULT_PORT"; return ;;
+                        y|Y) printf '%s\n' "$DEFAULT_PORT"; return ;;
                         *) continue ;;
                     esac
                 fi
-                echo "$DEFAULT_PORT"
+                printf '%s\n' "$DEFAULT_PORT"
                 return
                 ;;
             2)
@@ -179,14 +200,13 @@ choose_port() {
                         warn "端口 ${custom_port} 已被占用，请更换其他端口"
                         continue
                     fi
-                    echo "$custom_port"
+                    printf '%s\n' "$custom_port"
                     return
                 done
                 ;;
             3)
                 random_port=$(generate_random_port)
-                info "已生成随机可用端口：${random_port}"
-                echo "$random_port"
+                printf '%s\n' "$random_port"
                 return
                 ;;
             *)
@@ -222,7 +242,7 @@ show_menu() {
 
 show_help() {
     print_header
-    echo -e "${BOLD}命令行用法${NC}"
+    print_section "命令行用法"
     echo "  sudo $0 install         安装 AnyTLS"
     echo "  sudo $0 upgrade         升级 AnyTLS（保留配置）"
     echo "  sudo $0 status          查看服务状态"
@@ -284,6 +304,11 @@ create_service() {
     local listen_addr=$1
     local password=$2
 
+    if [ -z "$listen_addr" ] || [ -z "$password" ]; then
+        error "服务配置生成失败：监听地址或密码为空"
+        return 1
+    fi
+
     cat > "${SERVICE_FILE}" <<EOF2
 [Unit]
 Description=AnyTLS-Go Server
@@ -307,17 +332,34 @@ EOF2
     info "systemd 服务已创建并启动：${SERVICE_NAME}.service"
 }
 
+validate_current_config() {
+    local port password
+    port=$(get_current_port 2>/dev/null || true)
+    password=$(get_current_password 2>/dev/null || true)
+    [ -n "$port" ] && [ -n "$password" ]
+}
+
 show_current_config() {
     if ! is_installed; then
         error "AnyTLS 尚未安装"
     fi
 
     local port password
-    port=$(get_current_port)
-    password=$(get_current_password)
+    port=$(get_current_port 2>/dev/null || true)
+    password=$(get_current_password 2>/dev/null || true)
+
+    if [ -z "$port" ] || [ -z "$password" ]; then
+        print_header
+        print_section "配置读取失败"
+        echo "  当前检测到 AnyTLS 文件存在，但服务配置不完整或解析失败。"
+        echo "  请检查：${SERVICE_FILE}"
+        echo "  重点确认是否存在完整的 ExecStart 配置。"
+        print_divider
+        return 1
+    fi
 
     print_header
-    echo -e "${BOLD}当前配置信息${NC}"
+    print_section "当前配置信息"
     echo -e "  监听地址：${YELLOW}0.0.0.0:${port}${NC}"
     echo -e "  连接密码：${YELLOW}${password}${NC}"
     echo -e "  连接示例：${YELLOW}anytls://${password}@你的IP:${port}${NC}"
@@ -328,12 +370,17 @@ show_service_status() {
     if ! is_installed; then
         error "AnyTLS 尚未安装"
     fi
+    if ! command_exists systemctl; then
+        error "当前系统未安装 systemctl，无法查看服务状态"
+    fi
     systemctl status "${SERVICE_NAME}.service" --no-pager
 }
 
 # ====================== 安装 ======================
 do_install() {
-    require_root
+    if ! require_root; then
+        return 1
+    fi
 
     if command_exists apt; then
         apt update -qq && apt install -y curl unzip
@@ -349,26 +396,47 @@ do_install() {
 
     install_binary "$latest" "$arch"
 
-    port=$(choose_port)
+    port=$(choose_port | tail -n 1 | tr -d '\r')
     password=$(generate_password)
     listen_addr="0.0.0.0:${port}"
 
+    if ! is_valid_port "$port"; then
+        print_header
+        print_section "安装异常"
+        echo "  端口选择结果无效：${port}"
+        print_divider
+        return 1
+    fi
+
+    save_config "$port" "$password"
+
     create_service "$listen_addr" "$password"
 
+    if ! validate_current_config; then
+        print_header
+        print_section "安装异常"
+        echo "  AnyTLS 文件已写入，但当前服务配置解析失败。"
+        echo "  请检查：${SERVICE_FILE}"
+        print_divider
+        return 1
+    fi
+
     print_header
-    info "安装完成"
+    print_section "安装完成"
     echo -e "  监听地址：${YELLOW}${listen_addr}${NC}"
-    echo -e "  随机密码：${YELLOW}${password}${NC}"
-    echo -e "  客户端示例：${YELLOW}anytls://${password}@你的IP:${port}${NC}"
+    echo -e "  连接密码：${YELLOW}${password}${NC}"
+    echo -e "  连接示例：${YELLOW}anytls://${password}@你的IP:${port}${NC}"
     warn "请立即保存上面的密码信息"
     print_divider
-    echo "查看状态：systemctl status anytls"
-    echo "查看日志：journalctl -u anytls -f"
+    echo "  查看状态：systemctl status anytls"
+    echo "  查看日志：journalctl -u anytls -f"
 }
 
 # ====================== 升级（保留配置） ======================
 do_upgrade() {
-    require_root
+    if ! require_root; then
+        return 1
+    fi
 
     if ! is_installed; then
         error "AnyTLS 尚未安装，请先执行安装"
@@ -383,50 +451,78 @@ do_upgrade() {
     install_binary "$latest" "$arch"
 
     systemctl restart "${SERVICE_NAME}.service"
-    info "升级完成，服务已自动重启"
+    print_header
+    print_section "升级完成"
+    echo "  服务已自动重启，端口和密码保持不变"
+    print_divider
 }
 
 reset_port() {
-    require_root
+    if ! require_root; then
+        return 1
+    fi
 
     if ! is_installed; then
         error "AnyTLS 尚未安装"
     fi
 
     local current_password new_port listen_addr
-    current_password=$(get_current_password)
-    new_port=$(choose_port)
+    current_password=$(get_current_password 2>/dev/null || true)
+    new_port=$(choose_port | tail -n 1 | tr -d '\r')
     listen_addr="0.0.0.0:${new_port}"
+
+    if [ -z "$current_password" ] || ! is_valid_port "$new_port"; then
+        error "当前配置异常，无法重置端口"
+        return 1
+    fi
+
+    save_config "$new_port" "$current_password"
 
     create_service "$listen_addr" "$current_password"
     systemctl restart "${SERVICE_NAME}.service"
 
-    info "监听端口已更新为 ${new_port}"
-    echo -e "${YELLOW}连接示例：anytls://${current_password}@你的IP:${new_port}${NC}"
+    print_header
+    print_section "端口重置完成"
+    echo -e "  新端口：${YELLOW}${new_port}${NC}"
+    echo -e "  连接示例：${YELLOW}anytls://${current_password}@你的IP:${new_port}${NC}"
+    print_divider
 }
 
 reset_password() {
-    require_root
+    if ! require_root; then
+        return 1
+    fi
 
     if ! is_installed; then
         error "AnyTLS 尚未安装"
     fi
 
     local current_port new_password listen_addr
-    current_port=$(get_current_port)
+    current_port=$(get_current_port 2>/dev/null || true)
     new_password=$(generate_password)
     listen_addr="0.0.0.0:${current_port}"
+
+    if ! is_valid_port "$current_port" || [ -z "$new_password" ]; then
+        error "当前配置异常，无法重置密码"
+        return 1
+    fi
+
+    save_config "$current_port" "$new_password"
 
     create_service "$listen_addr" "$new_password"
     systemctl restart "${SERVICE_NAME}.service"
 
-    info "连接密码已重置"
-    echo -e "${YELLOW}新密码：${new_password}${NC}"
-    echo -e "${YELLOW}连接示例：anytls://${new_password}@你的IP:${current_port}${NC}"
+    print_header
+    print_section "密码重置完成"
+    echo -e "  新密码：${YELLOW}${new_password}${NC}"
+    echo -e "  连接示例：${YELLOW}anytls://${new_password}@你的IP:${current_port}${NC}"
+    print_divider
 }
 
 uninstall_anytls() {
-    require_root
+    if ! require_root; then
+        return 1
+    fi
 
     if ! is_installed; then
         error "AnyTLS 尚未安装"
@@ -444,10 +540,14 @@ uninstall_anytls() {
 
     systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
     rm -f "${SERVICE_FILE}"
+    rm -f "${CONFIG_FILE}"
     rm -f "${INSTALL_BIN_DIR}/anytls-server" "${INSTALL_BIN_DIR}/anytls-client"
     systemctl daemon-reload
 
-    info "AnyTLS 已成功卸载"
+    print_header
+    print_section "卸载完成"
+    echo "  AnyTLS 已成功卸载"
+    print_divider
 }
 
 pause_if_needed() {
