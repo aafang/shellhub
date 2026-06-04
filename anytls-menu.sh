@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================
 # AnyTLS-Go Linux 服务端一键安装与管理脚本
-# 功能：交互菜单 / 升级保留配置 / 随机密码 / 自定义或随机端口
+# 功能：交互菜单 / 升级保留配置 / 随机密码 / 自定义或随机端口 / 随机 PaddingScheme
 # 项目：https://github.com/anytls/anytls-go
 # =============================================
 
@@ -13,6 +13,7 @@ SERVICE_NAME="anytls"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CONFIG_DIR="/etc/anytls"
 CONFIG_FILE="${CONFIG_DIR}/anytls.conf"
+PADDING_SCHEME_FILE="${CONFIG_DIR}/padding_scheme.txt"
 DEFAULT_PORT=8443
 PORT_MIN=1024
 PORT_MAX=65535
@@ -224,6 +225,150 @@ generate_password() {
     fi
 }
 
+# ====================== PaddingScheme 生成 ======================
+# 根据 AnyTLS 协议规范随机生成 PaddingScheme
+# 参考：https://github.com/anytls/anytls-go/blob/main/docs/protocol.md
+generate_padding_scheme() {
+    local stop=$((RANDOM % 7 + 4))  # stop: 4-10
+    local scheme=""
+    local i j segments seg_min seg_max use_check
+
+    for ((i = 0; i < stop; i++)); do
+        local line="${i}="
+
+        case $i in
+            0)
+                # 认证包：小尺寸填充（认证开销 34 字节）
+                seg_min=$((RANDOM % 41 + 10))   # 10-50
+                seg_max=$((RANDOM % 31 + seg_min))  # seg_min ~ seg_min+30
+                line+="${seg_min}-${seg_max}"
+                ;;
+            1)
+                # cmdSettings + cmdSYN + cmdPSH：中等尺寸
+                seg_min=$((RANDOM % 201 + 50))   # 50-250
+                seg_max=$((RANDOM % 301 + seg_min))  # seg_min ~ seg_min+300
+                line+="${seg_min}-${seg_max}"
+                ;;
+            2)
+                # 首个数据包（如 TLS ClientHello）：分段 + check mark
+                segments=$((RANDOM % 3 + 2))  # 2-4 段
+                for ((j = 0; j < segments; j++)); do
+                    seg_min=$((RANDOM % 301 + 200))   # 200-500
+                    seg_max=$((RANDOM % 401 + seg_min))  # seg_min ~ seg_min+400
+                    [ $j -gt 0 ] && line+=","
+                    line+="${seg_min}-${seg_max}"
+                    # 每段后 40% 概率添加 check mark（最后一段不加）
+                    if [ $j -lt $((segments - 1)) ] && [ $((RANDOM % 5)) -lt 2 ]; then
+                        line+=",c"
+                    fi
+                done
+                ;;
+            *)
+                # 后续数据包：随机策略
+                local strategy=$((RANDOM % 3))
+                case $strategy in
+                    0)
+                        # 单段中等填充
+                        seg_min=$((RANDOM % 501 + 200))   # 200-700
+                        seg_max=$((RANDOM % 401 + seg_min))
+                        line+="${seg_min}-${seg_max}"
+                        ;;
+                    1)
+                        # 单段 + check mark
+                        seg_min=$((RANDOM % 501 + 200))
+                        seg_max=$((RANDOM % 401 + seg_min))
+                        line+="${seg_min}-${seg_max},c"
+                        # 可能追加第二段
+                        if [ $((RANDOM % 2)) -eq 0 ]; then
+                            seg_min=$((RANDOM % 401 + 300))   # 300-700
+                            seg_max=$((RANDOM % 401 + seg_min))
+                            line+=",${seg_min}-${seg_max}"
+                        fi
+                        ;;
+                    2)
+                        # 多段分包
+                        segments=$((RANDOM % 3 + 2))
+                        for ((j = 0; j < segments; j++)); do
+                            seg_min=$((RANDOM % 401 + 200))
+                            seg_max=$((RANDOM % 501 + seg_min))
+                            [ $j -gt 0 ] && line+=","
+                            line+="${seg_min}-${seg_max}"
+                            if [ $j -lt $((segments - 1)) ] && [ $((RANDOM % 3)) -eq 0 ]; then
+                                line+=",c"
+                            fi
+                        done
+                        ;;
+                esac
+                ;;
+        esac
+
+        scheme+="${line}\n"
+    done
+
+    # 写入文件（不含尾部换行差异）
+    mkdir -p "${CONFIG_DIR}"
+    umask 077
+    printf "stop=%d\n" "$stop" > "${PADDING_SCHEME_FILE}"
+    printf "%b" "$scheme" >> "${PADDING_SCHEME_FILE}"
+    # 移除可能的尾部空行
+    sed -i.bak '/^$/d' "${PADDING_SCHEME_FILE}" 2>/dev/null && rm -f "${PADDING_SCHEME_FILE}.bak"
+}
+
+show_padding_scheme() {
+    if [ ! -f "${PADDING_SCHEME_FILE}" ]; then
+        error "PaddingScheme 文件不存在，请先安装或生成"
+        return 1
+    fi
+
+    print_header
+    print_section "当前 PaddingScheme"
+    echo -e "${YELLOW}"
+    cat "${PADDING_SCHEME_FILE}"
+    echo -e "${NC}"
+
+    local md5_hash
+    if command_exists md5sum; then
+        md5_hash=$(md5sum "${PADDING_SCHEME_FILE}" | awk '{print $1}')
+    elif command_exists md5; then
+        md5_hash=$(md5 -q "${PADDING_SCHEME_FILE}")
+    fi
+    [ -n "$md5_hash" ] && echo -e "  MD5：${CYAN}${md5_hash}${NC}"
+    print_divider
+}
+
+regenerate_padding_scheme() {
+    if ! require_root; then
+        return 1
+    fi
+
+    if ! is_installed; then
+        error "AnyTLS 尚未安装"
+    fi
+
+    local port password listen_addr
+    port=$(get_current_port 2>/dev/null || true)
+    password=$(get_current_password 2>/dev/null || true)
+
+    if [ -z "$port" ] || [ -z "$password" ]; then
+        error "当前配置异常，无法重新生成 PaddingScheme"
+        return 1
+    fi
+
+    generate_padding_scheme
+
+    listen_addr="0.0.0.0:${port}"
+    create_service "$listen_addr" "$password"
+    systemctl restart "${SERVICE_NAME}.service"
+
+    print_header
+    print_section "PaddingScheme 已重新生成"
+    echo -e "${YELLOW}"
+    cat "${PADDING_SCHEME_FILE}"
+    echo -e "${NC}"
+    echo "  服务已自动重启"
+    print_divider
+}
+
 show_menu() {
     print_header
     show_summary
@@ -234,8 +379,10 @@ show_menu() {
     echo "  4）查看服务状态"
     echo "  5）重置监听端口"
     echo "  6）重置连接密码"
-    echo "  7）卸载 AnyTLS"
-    echo "  8）查看使用说明"
+    echo "  7）重新生成 PaddingScheme"
+    echo "  8）查看当前 PaddingScheme"
+    echo "  9）卸载 AnyTLS"
+    echo "  10）查看使用说明"
     echo "  0）退出脚本"
     print_divider
 }
@@ -249,6 +396,8 @@ show_help() {
     echo "  sudo $0 config          查看当前配置"
     echo "  sudo $0 reset-port      重置监听端口"
     echo "  sudo $0 reset-password  重置连接密码"
+    echo "  sudo $0 padding         重新生成 PaddingScheme"
+    echo "  sudo $0 padding-show    查看当前 PaddingScheme"
     echo "  sudo $0 uninstall       卸载 AnyTLS"
     echo "  sudo $0                 打开交互菜单"
     print_divider
@@ -309,6 +458,9 @@ create_service() {
         return 1
     fi
 
+    local padding_flag=""
+    [ -f "${PADDING_SCHEME_FILE}" ] && padding_flag=" --padding-scheme ${PADDING_SCHEME_FILE}"
+
     cat > "${SERVICE_FILE}" <<EOF2
 [Unit]
 Description=AnyTLS-Go Server
@@ -318,7 +470,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=${INSTALL_BIN_DIR}/anytls-server -l ${listen_addr} -p "${password}"
+ExecStart=${INSTALL_BIN_DIR}/anytls-server -l ${listen_addr} -p "${password}"${padding_flag}
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -363,6 +515,17 @@ show_current_config() {
     echo -e "  监听地址：${YELLOW}0.0.0.0:${port}${NC}"
     echo -e "  连接密码：${YELLOW}${password}${NC}"
     echo -e "  连接示例：${YELLOW}anytls://${password}@你的IP:${port}${NC}"
+    if [ -f "${PADDING_SCHEME_FILE}" ]; then
+        local md5_hash
+        if command_exists md5sum; then
+            md5_hash=$(md5sum "${PADDING_SCHEME_FILE}" | awk '{print $1}')
+        elif command_exists md5; then
+            md5_hash=$(md5 -q "${PADDING_SCHEME_FILE}")
+        fi
+        echo -e "  PaddingScheme MD5：${CYAN}${md5_hash:-已配置}${NC}"
+    else
+        echo -e "  PaddingScheme：${RED}未配置${NC}"
+    fi
     print_divider
 }
 
@@ -410,6 +573,8 @@ do_install() {
 
     save_config "$port" "$password"
 
+    generate_padding_scheme
+
     create_service "$listen_addr" "$password"
 
     if ! validate_current_config; then
@@ -426,6 +591,15 @@ do_install() {
     echo -e "  监听地址：${YELLOW}${listen_addr}${NC}"
     echo -e "  连接密码：${YELLOW}${password}${NC}"
     echo -e "  连接示例：${YELLOW}anytls://${password}@你的IP:${port}${NC}"
+    if [ -f "${PADDING_SCHEME_FILE}" ]; then
+        local md5_hash
+        if command_exists md5sum; then
+            md5_hash=$(md5sum "${PADDING_SCHEME_FILE}" | awk '{print $1}')
+        elif command_exists md5; then
+            md5_hash=$(md5 -q "${PADDING_SCHEME_FILE}")
+        fi
+        echo -e "  PaddingScheme MD5：${CYAN}${md5_hash}${NC}"
+    fi
     warn "请立即保存上面的密码信息"
     print_divider
     echo "  查看状态：systemctl status anytls"
@@ -541,6 +715,7 @@ uninstall_anytls() {
     systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
     rm -f "${SERVICE_FILE}"
     rm -f "${CONFIG_FILE}"
+    rm -f "${PADDING_SCHEME_FILE}"
     rm -f "${INSTALL_BIN_DIR}/anytls-server" "${INSTALL_BIN_DIR}/anytls-client"
     systemctl daemon-reload
 
@@ -559,7 +734,7 @@ interactive_menu() {
     local choice
     while true; do
         show_menu
-        read -rp "请输入菜单编号 [0-8]：" choice
+        read -rp "请输入菜单编号 [0-10]：" choice
         case "$choice" in
             1) do_install || true; pause_if_needed ;;
             2) do_upgrade || true; pause_if_needed ;;
@@ -567,8 +742,10 @@ interactive_menu() {
             4) show_service_status || true; pause_if_needed ;;
             5) reset_port || true; pause_if_needed ;;
             6) reset_password || true; pause_if_needed ;;
-            7) uninstall_anytls || true; pause_if_needed ;;
-            8) show_help || true; pause_if_needed ;;
+            7) regenerate_padding_scheme || true; pause_if_needed ;;
+            8) show_padding_scheme || true; pause_if_needed ;;
+            9) uninstall_anytls || true; pause_if_needed ;;
+            10) show_help || true; pause_if_needed ;;
             0)
                 info "已退出脚本"
                 break
@@ -600,6 +777,12 @@ case "$1" in
         ;;
     reset-password)
         reset_password
+        ;;
+    padding|regenerate-padding)
+        regenerate_padding_scheme
+        ;;
+    padding-show|show-padding)
+        show_padding_scheme
         ;;
     uninstall|remove)
         uninstall_anytls
